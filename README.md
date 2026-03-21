@@ -60,3 +60,46 @@ python3 -m http.server 80
 
 | Role          | ID     | Password  |
 |---------------|--------|-----------|
+| Administrator | admin  | admin123  |
+| Faculty       | T001   | teach123  |
+| Student       | S0001  | study123  |
+
+---
+
+## Tech Stack
+
+- **Frontend:** Vanilla JavaScript (ES2020+), HTML5, CSS3
+- **Auth & Database:** Firebase Authentication + Cloud Firestore
+- **Face Recognition:** face-api.js v0.22.2 (TensorFlow.js — SsdMobilenetv1)
+- **AI Chat:** Groq API (Llama 3.3 70B, Llama 3.1 8B, Mixtral 8x7B)
+- **Hosting:** Netlify (static, no server needed)
+
+---
+
+## Files
+
+```
+campusasthra/
+├── index.html      # App shell & modals
+├── app.js          # All logic (~4650 lines)
+├── style.css       # Theme & components (~720 lines)
+├── .gitignore
+└── README.md
+```
+
+---
+
+## Features
+
+- 🔐 Multi-role login (Admin / Faculty / Student)
+- 📸 Biometric face login & face-based attendance marking
+- 🧠 AI Doubt Solver (Groq API — multi-turn, saved chats)
+- 📋 Student & Faculty management with face registration
+- 📅 Timetable editor (branch / semester / section, teacher assignment)
+- 📄 Document request workflow (Bonafide, Transcript, NOC, TC)
+- 📊 VTU-format grade entry & CGPA calculation
+- 💰 Fee tracking & payment history
+
+---
+
+## Deployment
