@@ -2,7 +2,7 @@
 
 A biometric-enabled, AI-powered academic portal for VTU-affiliated engineering colleges.
 
-**Live demo:** https://campus-asthraa.netlify.app
+
 
 ---
 
