@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CampusAsthra — VTU Belagavi Affiliated Portal</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@500;600;700&family=IBM+Plex+Sans:wght@300;400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+
+  <!-- face-api.js — real face detection & recognition (TensorFlow.js based) -->
+  <!-- Loads from jsdelivr with unpkg as fallback — both support CORS from file:// -->
+  <script>
+    (function() {
+      var s = document.createElement('script');
+      s.src = 'https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js';
+      s.onerror = function() {
+        console.warn('[FaceAPI] jsdelivr failed, trying unpkg...');
+        var s2 = document.createElement('script');
+        s2.src = 'https://unpkg.com/face-api.js@0.22.2/dist/face-api.min.js';
+        document.head.appendChild(s2);
+      };
+      document.head.appendChild(s);
+    })();
+  </script>
+
+  <!-- Firebase SDK (compat version — works with simple script tags) -->
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+</head>
+
+<body>
+
+  <!-- ══════════════════════════════════════
+     TOAST NOTIFICATIONS
+══════════════════════════════════════ -->
+  <div class="toast-area" id="toastArea"></div>
+
+  <!-- ══════════════════════════════════════
+     FACE LOGIN MODAL
+══════════════════════════════════════ -->
+  <div class="overlay" id="faceLoginModal">
+    <div class="modal" style="width:480px;max-width:96vw">
+      <div class="modal-title">Biometric Authentication</div>
+      <div class="modal-sub" id="flmSub">Position your face in the frame and click Capture Photo</div>
+
+      <!-- Step 1: Live camera -->
+      <div id="flmStep1">
+        <div class="cam-frame" style="border-radius:8px;overflow:hidden">
+          <video id="flmVideo" autoplay muted playsinline style="width:100%;display:block;transform:scaleX(-1)"></video>
+          <div class="cam-sl"></div>
+          <div class="cc tl"></div><div class="cc tr"></div>
+          <div class="cc bl"></div><div class="cc br"></div>
+        </div>
+        <div class="cam-st scanning" id="flmStatus" style="margin-top:10px">Starting camera...</div>
+        <div class="m-actions" style="margin-top:12px">
+          <button class="btn-mc" onclick="closeFaceLoginModal()">Cancel</button>
+          <button class="btn-ma" id="flmCaptureBtn" onclick="capturePhotoForLogin()">📷 Capture Photo</button>
+        </div>
+      </div>
+
+      <!-- Step 2: Captured photo + matching result -->
+      <div id="flmStep2" style="display:none">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:12px;align-items:start">
+          <div>
+            <div style="font-size:10px;color:var(--tx3);margin-bottom:6px;letter-spacing:.6px;text-transform:uppercase;font-weight:600">Captured Photo</div>
+            <div style="border-radius:8px;overflow:hidden;border:2px solid var(--bd);aspect-ratio:4/3;background:#000">
+              <canvas id="flmCanvas" style="width:100%;height:100%;object-fit:cover;display:block"></canvas>
+            </div>
+          </div>
+          <div id="flmMatchResult" style="display:flex;flex-direction:column;justify-content:center;min-height:140px;background:var(--sf2);border-radius:8px;border:1px solid var(--bd)">
+            <div style="text-align:center;padding:20px;color:var(--tx3);font-size:12px">Analysing...</div>
+          </div>
+        </div>
+        <div class="cam-st scanning" id="flmStatus2">Matching face...</div>
+        <div class="m-actions" style="margin-top:12px">
+          <button class="btn-mc" onclick="retakePhotoLogin()">↺ Retake Photo</button>
+          <button class="btn-mc" onclick="closeFaceLoginModal()">Cancel</button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════
+     FACE REGISTER MODAL
+══════════════════════════════════════ -->
+  <div class="overlay" id="faceRegModal">
+    <div class="modal">
+      <div class="modal-title">Register Biometric Face</div>
+      <div class="modal-sub" id="frmSub">Capturing face data</div>
+      <div class="cam-frame">
+        <video id="frmVideo" autoplay muted playsinline></video>
+        <div class="cam-sl"></div>
+        <div class="cc tl"></div>
+        <div class="cc tr"></div>
+        <div class="cc bl"></div>
+        <div class="cc br"></div>
+        <canvas id="frmCanvas" style="display:none"></canvas>
+      </div>
+      <div class="cam-st scanning" id="frmStatus">Ensure face is centred and well-lit</div>
+      <div class="m-actions">
+        <button class="btn-mc" onclick="closeFaceRegModal()">Cancel</button>
+        <button class="btn-ma" id="frmBtn" onclick="captureAndSaveFace()">Capture &amp; Save to Firebase</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════
+     LOGIN PAGE — Split Layout
+══════════════════════════════════════ -->
+  <div id="loginPage" class="page active">
+
+    <!-- LEFT PANEL — Institution info -->
+    <div class="lp-left">
+      <!-- Top bar -->
+      <div class="lp-topbar">
+        <div class="lp-logo-wrap">
+          <div class="lp-logo-icon">
+            <svg width="22" height="22" fill="none" stroke="#fff" viewBox="0 0 24 24" stroke-width="1.8">
+              <path d="M22 10v6M2 10l10-5 10 5-10 5-10-5z"/>
+              <path d="M6 12v5c3 3 9 3 12 0v-5"/>
+            </svg>
+          </div>
+          <span class="lp-logo-name">Campus Asthra</span>
+        </div>
+        <div class="lp-badges">
+          <span class="lp-badge">CAIET</span>
+          <span class="lp-badge">VTU Affiliated</span>
+          <span class="lp-badge">AICTE Approved</span>
+        </div>
+      </div>
+
+      <!-- Hero text -->
+      <div class="lp-hero">
+        <h1 class="lp-hero-h1">Shaping Engineers,<br>Building Futures</h1>
+        <p class="lp-hero-sub">CampusAsthra Institute of Engineering &amp; Technology<br>Affiliated to Visvesvaraya Technological University, Belagavi</p>
+      </div>
+
+      <!-- Features -->
+      <div class="lp-features">
+        <div class="lp-feat">
+          <div class="lp-feat-icon">
+            <svg width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.8">
+              <circle cx="12" cy="8" r="4"/><path d="M20 21a8 8 0 1 0-16 0"/>
+              <path d="M9 12.5c.5 1 1.5 1.5 3 1.5s2.5-.5 3-1.5"/>
+            </svg>
+          </div>
+          <div>
+            <div class="lp-feat-title">Biometric Face ID Attendance</div>
+            <div class="lp-feat-sub">Zero proxy, 100% accurate</div>
+          </div>
+        </div>
+        <div class="lp-feat">
+          <div class="lp-feat-icon">
+            <svg width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.8">
+              <path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20z"/>
+              <path d="M12 8v4l3 3"/>
+            </svg>
+          </div>
+          <div>
+            <div class="lp-feat-title">AI-Powered Study Assistant</div>
+            <div class="lp-feat-sub">Doubt clearance, anytime — Groq AI</div>
+          </div>
+        </div>
+        <div class="lp-feat">
+          <div class="lp-feat-icon">
+            <svg width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.8">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+              <polyline points="14 2 14 8 20 8"/>
+              <line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/>
+            </svg>
+          </div>
+          <div>
+            <div class="lp-feat-title">VTU-Compliant Grade Cards</div>
+            <div class="lp-feat-sub">Tamper-proof digital credentials</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Stats bar -->
+      <div class="lp-stats">
+        <div class="lp-stat"><div class="lp-stat-num">1000+</div><div class="lp-stat-lbl">Students</div></div>
+        <div class="lp-stat-div"></div>
+        <div class="lp-stat"><div class="lp-stat-num">500</div><div class="lp-stat-lbl">Faculty</div></div>
+        <div class="lp-stat-div"></div>
+        <div class="lp-stat"><div class="lp-stat-num">7</div><div class="lp-stat-lbl">Branches</div></div>
+        <div class="lp-stat-div"></div>
+        <div class="lp-stat"><div class="lp-stat-num">8</div><div class="lp-stat-lbl">Semesters</div></div>
+      </div>
+    </div>
+
+    <!-- RIGHT PANEL — Login form -->
+    <div class="lp-right">
+      <div class="lp-form-wrap">
+
+        <!-- Logo + title -->
+        <div class="lp-form-hdr">
+          <div class="lp-form-logo">
+            <svg width="26" height="26" fill="none" stroke="#fff" viewBox="0 0 24 24" stroke-width="1.8">
+              <path d="M22 10v6M2 10l10-5 10 5-10 5-10-5z"/>
+              <path d="M6 12v5c3 3 9 3 12 0v-5"/>
+            </svg>
+          </div>
+          <span class="lp-form-logo-name">Campus Asthra</span>
+        </div>
+        <h2 class="lp-form-title">Welcome Back</h2>
+        <p class="lp-form-sub">Sign in to Campus Asthra Portal</p>
+
+        <!-- Role tabs -->
+        <div class="role-grid" style="margin-bottom:20px">
+          <button class="rt active" onclick="setRole('admin')" id="rtAdmin">
+            <svg width="15" height="15" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.8">
+              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+            </svg>
+            Admin
+          </button>
+          <button class="rt" onclick="setRole('teacher')" id="rtTeacher">
+            <svg width="15" height="15" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.8">
+              <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+              <circle cx="9" cy="7" r="4"/>
+              <path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/>
+            </svg>
+            Teacher
+          </button>
+          <button class="rt" onclick="setRole('student')" id="rtStudent">
+            <svg width="15" height="15" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.8">
+              <path d="M22 10v6M2 10l10-5 10 5-10 5-10-5z"/>
+              <path d="M6 12v5c3 3 9 3 12 0v-5"/>
+            </svg>
+            Student
+          </button>
+        </div>
+
+        <!-- ID field -->
+        <div class="fl">
+          <label>User ID</label>
+          <div class="fi-wrap">
+            <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.8">
+              <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+              <circle cx="12" cy="7" r="4"/>
+            </svg>
+            <input class="fi" type="text" id="loginId" placeholder="admin / T001 / S0001">
+          </div>
+        </div>
+
+        <!-- Password field -->
+        <div class="fl">
+          <label>Password</label>
+          <div class="fi-wrap">
+            <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.8">
+              <rect x="3" y="11" width="18" height="11" rx="2"/>
+              <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+            </svg>
+            <input class="fi" type="password" id="loginPwd" placeholder="Enter password"
+              onkeypress="if(event.key==='Enter') doLogin()">
+          </div>
+        </div>
+
+        <!-- Sign in button -->
+        <button class="btn-primary" id="loginBtn" onclick="doLogin()" style="margin-top:4px">
+          Sign In →
+        </button>
+
+        <!-- Divider -->
+        <div class="divline">or use biometrics</div>
+
+        <!-- Face login -->
+        <button class="face-btn" onclick="openFaceLoginModal()">
+          <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.6">
+            <circle cx="12" cy="8" r="4"/>
+            <path d="M20 21a8 8 0 1 0-16 0"/>
+            <path d="M9 12.5c.5 1 1.5 1.5 3 1.5s2.5-.5 3-1.5"/>
+          </svg>
+          Face ID Login
+        </button>
+
+        <!-- Demo credentials (collapsible) -->
+        <details class="demo-box" style="cursor:pointer">
+          <summary class="demo-box-t" style="cursor:pointer;list-style:none">🔑 Demo Credentials</summary>
+          <div style="margin-top:8px">
+            <div class="dc">Admin: <span>admin / admin123</span></div>
+            <div class="dc">Faculty: <span>T001 / teach123</span></div>
+            <div class="dc">Student: <span>S0001 / study123</span></div>
+          </div>
+        </details>
+
+        <!-- First time setup -->
+        <div id="setupBox" style="margin-top:10px;padding:12px;background:rgba(212,134,42,.08);border:1px solid rgba(212,134,42,.3);border-radius:var(--r2);">
+          <div style="font-size:10px;color:var(--amber);font-weight:700;letter-spacing:1px;text-transform:uppercase;margin-bottom:5px">⚡ First Time Setup</div>
+          <div style="font-size:11px;color:var(--tx2);margin-bottom:8px;line-height:1.5">If login fails, click below to create Firebase Auth accounts.</div>
+          <button onclick="firstTimeSetup()" id="setupBtn" style="width:100%;padding:9px;background:rgba(212,134,42,.15);border:1px solid rgba(212,134,42,.4);border-radius:var(--r2);color:var(--amber);font-family:var(--fb);font-size:12px;font-weight:600;cursor:pointer">
+            Create Firebase Auth Accounts
+          </button>
+          <div id="setupStatus" style="font-size:11px;margin-top:6px;display:none"></div>
+        </div>
+
+        <!-- Firebase status -->
+        <div class="fb-ind" style="margin-top:10px">
+          <div class="fb-dot wait" id="fbDot"></div>
+          <span id="fbTxt" style="color:var(--tx3);font-size:10.5px">Connecting...</span>
+          <span style="margin-left:auto;font-size:9.5px;color:var(--tx3);font-family:var(--fm)" id="fbProjectLabel">—</span>
+        </div>
+
+        <!-- Footer note -->
+        <p class="lp-form-footer">Secured by Campus Asthra · VTU Affiliated · NAAC Accredited</p>
+
+      </div>
+    </div>
+
+  </div><!-- end loginPage -->
+
+  <!-- ══════════════════════════════════════
+     DASHBOARD PAGE
+══════════════════════════════════════ -->
+  <div id="dashPage" class="page">
+
+    <!-- Top navigation bar -->
+    <div class="topbar">
+      <div class="tb-left">
+        <svg width="22" height="22" fill="none" stroke="var(--gold)" viewBox="0 0 24 24" stroke-width="1.5">
+          <path d="M22 10v6M2 10l10-5 10 5-10 5-10-5z" />
+          <path d="M6 12v5c3 3 9 3 12 0v-5" />
+        </svg>
+        <div>
+          <div class="tb-logo">CampusAsthra</div>
+          <div class="tb-affil">VTU Belagavi Affiliated</div>
+        </div>
+        <div class="tb-sep"></div>
+        <div class="role-chip" id="topChip"></div>
+      </div>
+      <div class="tb-right">
+        <div style="display:flex;align-items:center;gap:7px">
+          <div class="tb-av" id="topAv">A</div>
+          <div>
+            <div class="tb-uname" id="topName">—</div>
+            <div class="tb-uid" id="topUid">—</div>
+          </div>
+        </div>
+        <!-- Firebase live indicator -->
+        <div
+          style="display:flex;align-items:center;gap:5px;padding:3px 8px;background:var(--sf2);border-radius:4px;font-size:9.5px;">
+          <div class="fb-dot" id="fbDotTop"></div>
+          <span id="fbTxtTop" style="color:var(--tx3)">—</span>
+        </div>
+        <button class="btn-logout" onclick="doLogout()">
+          <svg width="12" height="12" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2">
+            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9" />
+          </svg>
+          Sign Out
+        </button>
+      </div>
+    </div>
+
+    <!-- Dashboard body: sidebar + content -->
+    <div class="dash-body">
+      <div class="sidebar" id="sidebar">
+        <div id="navItems"></div>
+      </div>
+      <div class="content" id="mc"></div>
+    </div>
+
+  </div><!-- end dashPage -->
+
+  <!-- Load app logic AFTER DOM is ready -->
+  <script src="app.js"></script>
+
+</body>
+
+</html>
