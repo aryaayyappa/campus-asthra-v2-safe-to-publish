@@ -40,6 +40,10 @@ const IC = {
 // Get it from: Firebase Console → Project Settings → Your Apps → SDK setup
 // NEVER commit real keys to a public repo — use a config file excluded via .gitignore
 // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// FIREBASE CONFIGURATION — replace with your own project values
+// Firebase Console → Project Settings → Your Apps → SDK setup
+// ─────────────────────────────────────────────────────────────────────────────
 const FB_CFG = {
   apiKey:            "YOUR_FIREBASE_API_KEY",
   authDomain:        "YOUR_PROJECT_ID.firebaseapp.com",
@@ -185,6 +189,7 @@ function initFirebase() {
   try {
     if (firebase.apps.length) firebase.apps.forEach(a => a.delete());
     firebase.initializeApp(FB_CFG);
+    const _lbl=document.getElementById('fbProjectLabel'); if(_lbl) _lbl.textContent=FB_CFG.projectId||'—';
     db     = firebase.firestore();
     fbAuth = firebase.auth();
     fbMode = 'firebase';
@@ -2311,7 +2316,7 @@ async function adminSettings() {
     '<div style="font-size:12.5px;color:var(--tx2);line-height:2">',
     [
       'Open <a href="https://console.firebase.google.com" target="_blank" style="color:var(--blue2)">console.firebase.google.com</a>',
-      'Select your project → <strong style="color:var(--tx)">campus-asthra-v2</strong>',
+      'Select your project → <strong style="color:var(--tx)">your-project-id</strong>',
       'Left sidebar → <strong style="color:var(--tx)">Firestore Database</strong>',
       'Click the <strong style="color:var(--tx)">Rules</strong> tab at the top',
       'Click <strong style="color:var(--gold)">Copy Rules</strong> below, then paste into the Firebase editor',
@@ -3172,8 +3177,8 @@ const GROQ_API_KEY = 'YOUR_GROQ_API_KEY_HERE';
 const GROQ_MODELS = [
   { id: 'llama-3.3-70b-versatile',    label: 'Llama 3.3 70B',  note: 'Best quality'  },
   { id: 'llama-3.1-8b-instant',       label: 'Llama 3.1 8B',   note: 'Fastest'       },
-  { id: 'mixtral-8x7b-32768',         label: 'Mixtral 8x7B',   note: 'Long context'  },
-  { id: 'llama3-70b-8192',            label: 'Llama 3 70B',    note: 'Stable'        },
+
+
 ];
 
 // ── CHAT SESSION STATE ─────────────────────────────────────────────────────
@@ -3989,7 +3994,7 @@ async function quickFaceReg(personId, type) {
 //  Matching: Euclidean distance, threshold 0.5
 // ══════════════════════════════════════════════════════════════════════════════
 
-const FACE_MATCH_THRESHOLD = 0.90; // 0.7 works well for real webcam conditions
+const FACE_MATCH_THRESHOLD = 0.90; // very lenient — accepts varied lighting, angles and conditions
 
 // Multiple CDN fallbacks — jsdelivr may fail when running from file://
 const FACE_MODEL_CDNS = [
@@ -4060,7 +4065,7 @@ async function computeDescriptor(inputEl) {
   try {
     // SsdMobilenetv1 is more reliable than TinyFaceDetector for recognition tasks
     const options = new faceapi.SsdMobilenetv1Options({
-      minConfidence: 0.2   // very low threshold — catches faces in varied conditions
+      minConfidence: 0.15  // very low — catches faces even in poor lighting or partial views
     });
 
     const det = await faceapi
@@ -4312,7 +4317,9 @@ async function capturePhotoForLogin() {
     return;
   }
 
-  const confidence = Math.round((1 - bestDist / FACE_MATCH_THRESHOLD) * 100);
+  // Confidence: map raw distance to 0–100% independently of threshold
+  // dist=0.0 → 100%, dist=0.5 → 65%, dist=0.82 → 30% — readable scale
+  const confidence = Math.max(10, Math.round((1 - bestDist * 0.85) * 100));
   stat2.textContent = '✓ Matched: ' + best.personName + ' (' + confidence + '% confidence)';
   stat2.className = 'cam-st success';
 
@@ -4639,14 +4646,14 @@ window.addEventListener('DOMContentLoaded', async function () {
       new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 6000))
     ]);
     // Reachable — show setup box in case accounts haven't been created yet
-    setFbDot('on', 'campus-asthra-v2');
+    setFbDot('on', FB_CFG.projectId);
     const sb = document.getElementById('setupBox');
     if (sb) sb.style.display = 'block';
   } catch (e) {
     if (e.code === 'permission-denied') {
       // Security rules active — correct secured state, accounts exist
       fbMode = 'firebase';
-      setFbDot('on', 'campus-asthra-v2');
+      setFbDot('on', FB_CFG.projectId);
       const sb = document.getElementById('setupBox');
       if (sb) sb.style.display = 'none';
     } else if (e.message === 'timeout') {
@@ -4656,7 +4663,7 @@ window.addEventListener('DOMContentLoaded', async function () {
       if (sb) sb.style.display = 'none';
     } else {
       console.warn('Firebase startup:', e.code, e.message);
-      setFbDot('on', 'campus-asthra-v2');
+      setFbDot('on', FB_CFG.projectId);
     }
   }
 
