@@ -103,3 +103,5 @@ campusasthra/
 ---
 
 ## Deployment
+Drop `index.html`, `app.js`, and `style.css` into Netlify → done.  
+Add your Netlify domain to Firebase Console → Authentication → Authorized Domains.
