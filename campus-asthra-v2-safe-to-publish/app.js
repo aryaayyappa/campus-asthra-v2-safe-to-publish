@@ -3989,7 +3989,7 @@ async function quickFaceReg(personId, type) {
 //  Matching: Euclidean distance, threshold 0.5
 // ══════════════════════════════════════════════════════════════════════════════
 
-const FACE_MATCH_THRESHOLD = 0.7; // 0.7 works well for real webcam conditions
+const FACE_MATCH_THRESHOLD = 0.90; // 0.7 works well for real webcam conditions
 
 // Multiple CDN fallbacks — jsdelivr may fail when running from file://
 const FACE_MODEL_CDNS = [
