@@ -11,18 +11,29 @@
   <link rel="stylesheet" href="style.css">
 
   <!-- face-api.js — real face detection & recognition (TensorFlow.js based) -->
-  <!-- Loads from jsdelivr with unpkg as fallback — both support CORS from file:// -->
+  <!-- face-api.js — 4-CDN waterfall loader with load confirmation -->
   <script>
     (function() {
-      var s = document.createElement('script');
-      s.src = 'https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js';
-      s.onerror = function() {
-        console.warn('[FaceAPI] jsdelivr failed, trying unpkg...');
-        var s2 = document.createElement('script');
-        s2.src = 'https://unpkg.com/face-api.js@0.22.2/dist/face-api.min.js';
-        document.head.appendChild(s2);
-      };
-      document.head.appendChild(s);
+      var CDNS = [
+        'https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js',
+        'https://unpkg.com/face-api.js@0.22.2/dist/face-api.min.js',
+        'https://cdnjs.cloudflare.com/ajax/libs/face-api.js/0.22.2/face-api.min.js',
+        'https://raw.githack.com/justadudewhohacks/face-api.js/0.22.2/dist/face-api.min.js',
+      ];
+      var idx = 0;
+      function tryNext() {
+        if (idx >= CDNS.length) {
+          console.error('[FaceAPI] All CDNs failed — face recognition will be unavailable');
+          window._faceApiScriptFailed = true;
+          return;
+        }
+        var s = document.createElement('script');
+        s.src = CDNS[idx++];
+        s.onload  = function() { console.log('[FaceAPI] Script loaded from:', s.src); window._faceApiScriptLoaded = true; };
+        s.onerror = function() { console.warn('[FaceAPI] Failed:', s.src, '— trying next...'); tryNext(); };
+        document.head.appendChild(s);
+      }
+      tryNext();
     })();
   </script>
 
