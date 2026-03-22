@@ -33,6 +33,178 @@ const IC = {
 };
 
 // ── FIREBASE CONFIG ─────────────────────────────
+
+// ════════════════════════════════════════════════════════════════════════════
+// SECURITY MODULE — Rate limiting, input sanitisation, session management
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── 1. INPUT SANITISATION ────────────────────────────────────────────────────
+// Escapes HTML special characters to prevent XSS in any user-supplied string
+function sanitize(str) {
+  if (str === null || str === undefined) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#x27;')
+    .replace(/\//g, '&#x2F;');
+}
+
+// Strips all HTML tags — use for names, cities, reasons stored to Firestore
+function stripTags(str) {
+  if (!str) return '';
+  return String(str).replace(/<[^>]*>/g, '').trim();
+}
+
+// Validates common field formats before saving
+const VALIDATE = {
+  id:      v => /^[A-Za-z0-9_-]{1,20}$/.test(v),
+  name:    v => v && v.trim().length >= 2 && v.trim().length <= 80,
+  phone:   v => !v || /^[6-9]\d{9}$/.test(v.replace(/\s/g,'')),
+  usn:     v => !v || /^[0-9A-Z]{10,12}$/.test(v.toUpperCase()),
+  email:   v => !v || /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v),
+  city:    v => !v || (v.trim().length <= 60),
+  reason:  v => !v || v.trim().length <= 500,
+  title:   v => v && v.trim().length >= 3 && v.trim().length <= 120,
+  body:    v => v && v.trim().length >= 5 && v.trim().length <= 2000,
+  room:    v => !v || /^[A-Za-z0-9\s\-\/]{1,20}$/.test(v),
+  msg:     v => v && v.trim().length >= 1 && v.trim().length <= 2000,
+};
+
+// ── 2. RATE LIMITER ──────────────────────────────────────────────────────────
+// Generic in-memory rate limiter: key → { count, firstAt }
+const _rl = {};
+function rateLimit(key, maxHits, windowMs) {
+  const now = Date.now();
+  if (!_rl[key] || now - _rl[key].firstAt > windowMs) {
+    _rl[key] = { count: 1, firstAt: now };
+    return true; // allowed
+  }
+  _rl[key].count++;
+  if (_rl[key].count > maxHits) return false; // blocked
+  return true;
+}
+function rlRemaining(key, maxHits) {
+  if (!_rl[key]) return maxHits;
+  return Math.max(0, maxHits - _rl[key].count);
+}
+
+// ── 3. LOGIN RATE LIMITS ─────────────────────────────────────────────────────
+// 5 attempts per 10 minutes per role — after that, 30-second cooldown warning
+const LOGIN_MAX   = 5;
+const LOGIN_WINDOW = 10 * 60 * 1000; // 10 minutes
+const _loginLock = {}; // role → lockedUntil timestamp
+
+function loginRateCheck(role) {
+  const key = 'login_' + role;
+  // Check hard lock first
+  if (_loginLock[role] && Date.now() < _loginLock[role]) {
+    const secs = Math.ceil((_loginLock[role] - Date.now()) / 1000);
+    showToast('Too many failed attempts. Try again in ' + secs + 's.', 'error');
+    return false;
+  }
+  if (!rateLimit(key, LOGIN_MAX, LOGIN_WINDOW)) {
+    _loginLock[role] = Date.now() + 30000; // 30-second lockout
+    showToast('Too many login attempts. Locked for 30 seconds.', 'error');
+    return false;
+  }
+  return true;
+}
+
+function loginSuccess(role) {
+  // Clear rate limit on success
+  delete _rl['login_' + role];
+  delete _loginLock[role];
+}
+
+// ── 4. AI CHAT RATE LIMITS ───────────────────────────────────────────────────
+// 20 messages per minute, 100 per hour per student session
+const CHAT_MAX_MIN  = 20;
+const CHAT_MAX_HOUR = 100;
+function chatRateCheck() {
+  const uid = currentUser ? currentUser.id : 'anon';
+  const minKey  = 'chat_min_'  + uid;
+  const hourKey = 'chat_hour_' + uid;
+  if (!rateLimit(minKey,  CHAT_MAX_MIN,  60 * 1000))       { showToast('Slow down! Max ' + CHAT_MAX_MIN + ' messages per minute.', 'error'); return false; }
+  if (!rateLimit(hourKey, CHAT_MAX_HOUR, 60 * 60 * 1000))  { showToast('Hourly AI limit reached (' + CHAT_MAX_HOUR + ' messages). Try again later.', 'error'); return false; }
+  return true;
+}
+
+// ── 5. DOCUMENT REQUEST RATE LIMIT ──────────────────────────────────────────
+// 3 doc requests per day per student
+const DOC_MAX_DAY = 3;
+function docReqRateCheck() {
+  const uid = currentUser ? currentUser.id : 'anon';
+  if (!rateLimit('docreq_' + uid, DOC_MAX_DAY, 24 * 60 * 60 * 1000)) {
+    showToast('Maximum ' + DOC_MAX_DAY + ' document requests per day.', 'error');
+    return false;
+  }
+  return true;
+}
+
+// ── 6. FACE CAPTURE RATE LIMIT ───────────────────────────────────────────────
+// 10 face capture attempts per minute (prevents hammering the ML model)
+function faceRateCheck() {
+  if (!rateLimit('face_capture', 10, 60 * 1000)) {
+    showToast('Too many capture attempts. Wait a moment.', 'error');
+    return false;
+  }
+  return true;
+}
+
+// ── 7. SESSION TIMEOUT ───────────────────────────────────────────────────────
+// Auto sign-out after 60 minutes of inactivity
+const SESSION_TIMEOUT_MS = 60 * 60 * 1000; // 60 minutes
+let _lastActivity = Date.now();
+let _sessionTimer = null;
+
+function resetActivityTimer() {
+  _lastActivity = Date.now();
+  clearTimeout(_sessionTimer);
+  _sessionTimer = setTimeout(() => {
+    if (currentUser) {
+      showToast('Session expired due to inactivity. Please sign in again.', 'info');
+      setTimeout(doLogout, 2000);
+    }
+  }, SESSION_TIMEOUT_MS);
+}
+
+// Track user activity
+['click','keydown','mousemove','touchstart'].forEach(evt =>
+  document.addEventListener(evt, () => { if (currentUser) resetActivityTimer(); }, { passive: true })
+);
+
+// ── 8. CONTENT SECURITY POLICY ───────────────────────────────────────────────
+// Inject CSP meta tag programmatically
+(function injectCSP() {
+  const csp = document.createElement('meta');
+  csp.httpEquiv = 'Content-Security-Policy';
+  csp.content = [
+    "default-src 'self'",
+    "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://unpkg.com https://cdnjs.cloudflare.com https://www.gstatic.com https://www.googleapis.com https://cdn.rawgit.com https://raw.githack.com https://raw.githubusercontent.com",
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+    "font-src 'self' https://fonts.gstatic.com",
+    "img-src 'self' data: blob:",
+    "connect-src 'self' https://*.googleapis.com https://*.firebaseio.com https://*.cloudfunctions.net https://api.groq.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://raw.githubusercontent.com https://raw.githack.com https://cdnjs.cloudflare.com",
+    "frame-src 'none'",
+    "object-src 'none'",
+    "base-uri 'self'",
+  ].join('; ');
+  document.head.prepend(csp);
+})();
+
+// ── 9. CLICKJACKING PROTECTION ───────────────────────────────────────────────
+// Prevent the app being embedded in an iframe
+if (window.self !== window.top) {
+  document.body.innerHTML = '<div style="padding:40px;font-family:Arial;color:#c81e1e;font-size:18px">Access denied: this page cannot be displayed in a frame.</div>';
+  throw new Error('Clickjacking attempt blocked.');
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// END SECURITY MODULE
+// ════════════════════════════════════════════════════════════════════════════
+
 // ─────────────────────────────────────────────────────────────────────────────
 // FIREBASE CONFIGURATION
 // ─────────────────────────────────────────────────────────────────────────────
@@ -57,7 +229,7 @@ const FB_CFG = {
 //  DATA — 1000 Students · 500 Teachers · 7 Branches
 // ════════════════════════════════════════════════
 const BR = ['CSE', 'ECE', 'ME', 'CIV', 'EEE', 'ISE', 'AIML'];
-const SUBJ = {
+let SUBJ = {
   CSE: ['Data Structures', 'Algorithms', 'DBMS', 'Operating Systems', 'Computer Networks'],
   ECE: ['Digital Electronics', 'Signals & Systems', 'VLSI Design', 'Microprocessors', 'DSP'],
   ME: ['Engineering Mechanics', 'Thermodynamics', 'Fluid Mechanics', 'Manufacturing', 'CAD/CAM'],
@@ -334,7 +506,40 @@ async function getFacesForMatching() {
     return Object.values(DEMO.faces || {});
   }
 }
-async function getDocReqs()  { return fbMode === 'firebase' ? dbAll('docRequests')  : DEMO.docRequests.slice(); }
+async function getDocReqs() {
+  if (fbMode !== 'firebase') return DEMO.docRequests.slice();
+  const snap = await db.collection('docRequests').get();
+  const seen = new Set();
+  const clean = [];
+  const toDelete = []; // ghost docs: Firestore ID != data.id (created via dbAdd)
+
+  snap.docs.forEach(d => {
+    const data = d.data();
+    const firestoreId = d.id;          // actual Firestore document ID
+    const dataId      = data.id || firestoreId; // 'id' field inside the document
+
+    // Ghost: was created with dbAdd → Firestore ID is auto-generated ≠ dataId
+    const isGhost = firestoreId !== dataId && firestoreId.length > 15 && !firestoreId.startsWith('DR');
+    if (isGhost) {
+      toDelete.push(firestoreId); // schedule for deletion
+      return; // skip it — don't show the ghost
+    }
+
+    // Deduplicate by dataId
+    if (seen.has(dataId)) return;
+    seen.add(dataId);
+
+    clean.push({ ...data, id: firestoreId }); // always use Firestore doc ID as the working id
+  });
+
+  // Auto-delete ghost records in background
+  if (toDelete.length > 0) {
+    console.log('[DocReq] Auto-deleting', toDelete.length, 'ghost record(s):', toDelete);
+    toDelete.forEach(gid => db.collection('docRequests').doc(gid).delete().catch(() => {}));
+  }
+
+  return clean;
+}
 async function getNotices()  { return fbMode === 'firebase' ? dbAll('notices')      : DEMO.notices.slice(); }
 
 // ── SEED FIREBASE — quota-safe: Auth accounts + essential docs only ────────────
@@ -450,9 +655,14 @@ function setRole(r) {
 }
 
 async function doLogin() {
-  const id = document.getElementById('loginId').value.trim();
+  const id  = stripTags(document.getElementById('loginId').value.trim());
   const pwd = document.getElementById('loginPwd').value;
   if (!id || !pwd) { showToast('Please enter credentials', 'error'); return; }
+
+  // Rate limit: 5 attempts per 10 minutes per role
+  if (!loginRateCheck(currentRole)) {
+    return;
+  }
 
   const btn = document.getElementById('loginBtn');
   btn.textContent = 'Authenticating...'; btn.disabled = true;
@@ -549,6 +759,8 @@ async function doLogin() {
 function enterDash() {
   document.getElementById('loginPage').classList.remove('active');
   document.getElementById('dashPage').classList.add('active');
+  loginSuccess(currentUser.role); // clear login rate limit
+  resetActivityTimer();           // start session inactivity timeout
 
   const chips = { admin: 'bgold', teacher: 'bb', student: 'bg' };
   const labels = { admin: 'Administrator', teacher: 'Faculty', student: 'Student' };
@@ -580,7 +792,7 @@ const NAVDEF = {
   admin: [
     { s: 'Main', items: [{ id: 'adminDash', icon: 'dashboard', l: 'Dashboard' }, { id: 'adminStudents', icon: 'students', l: 'Students' }, { id: 'adminTeachers', icon: 'teachers', l: 'Faculty' }] },
     { s: 'Management', items: [{ id: 'adminAttendance', icon: 'attendance', l: 'Attendance' }, { id: 'adminFaceReg', icon: 'face', l: 'Face Registration' }, { id: 'adminDocReq', icon: 'docs', l: 'Doc Requests' }, { id: 'adminTimetable', icon: 'timetable', l: 'Timetable' }] },
-    { s: 'System', items: [{ id: 'adminNotices', icon: 'notices', l: 'Notices' }, { id: 'adminSettings', icon: 'settings', l: 'Settings' }] }
+    { s: 'System', items: [{ id: 'adminNotices', icon: 'notices', l: 'Notices' }, { id: 'adminSubjects', icon: 'grades', l: 'Subjects' }, { id: 'adminSettings', icon: 'settings', l: 'Settings' }] }
   ],
   teacher: [
     { s: 'Main', items: [{ id: 'teacherDash', icon: 'dashboard', l: 'Dashboard' }, { id: 'teacherAttendance', icon: 'attendance', l: 'Mark Attendance' }, { id: 'teacherGrades', icon: 'grades', l: 'Grades' }] },
@@ -617,7 +829,7 @@ function navigateTo(id) {
   const el = document.getElementById('mc');
   el.innerHTML = '<div class="spinner"></div>';
 
-  const pages = { adminDash, adminStudents, adminTeachers, adminAttendance, adminFaceReg, adminDocReq, adminTimetable, adminNotices, adminSettings, teacherDash, teacherAttendance, teacherGrades, teacherClassroom, teacherTimetable, teacherNotices, studentDash, studentAttendance, studentGrades, studentAI, studentClassroom, studentDocReq, studentFees, studentTimetable, studentNotices, studentProfile };
+  const pages = { adminDash, adminStudents, adminTeachers, adminAttendance, adminFaceReg, adminDocReq, adminTimetable, adminNotices, adminSubjects, adminSettings, teacherDash, teacherAttendance, teacherGrades, teacherClassroom, teacherTimetable, teacherNotices, studentDash, studentAttendance, studentGrades, studentAI, studentClassroom, studentDocReq, studentFees, studentTimetable, studentNotices, studentProfile };
 
   if (pages[id]) {
     pages[id]().catch(e => {
@@ -994,7 +1206,7 @@ async function saveEditStudent(id) {
   const city    = (document.getElementById('es_city')   || {}).value.trim();
   const cgpa    = parseFloat((document.getElementById('es_cgpa') || {}).value) || 0;
   const feeStatus = (document.getElementById('es_fee')  || {}).value || 'Paid';
-  if (!name) { showToast('Name is required', 'error'); return; }
+  if (!VALIDATE.name(name)) { showToast('Name must be 2–80 characters', 'error'); return; }
 
   const updates = { name, branch, semester: sem, section, phone, city, cgpa, feeStatus };
   try {
@@ -1279,7 +1491,7 @@ async function saveNewTeacher() {
   const tchs   = window._tchArr || await getTeachers();
   const newNum = tchs.length + 1;
   const id     = 'T' + String(newNum).padStart(3, '0');
-  const subs   = SUBJ[branch] || ['General'];
+  const subs   = getSubjects(branch, window._attSem || 1);
   const email  = (document.getElementById('nt_email') || {}).value.trim() || id.toLowerCase() + '@campusasthra.edu.in';
 
   const doc = {
@@ -2067,7 +2279,8 @@ async function saveTT(branch, sem, section, slots) {
 
 // Build default timetable from SUBJ
 function defaultSlots(branch) {
-  const subj  = SUBJ[branch] || ['Subject'];
+  const sem   = window._ttSem || 1;
+  const subj  = getSubjects(branch, sem);
   const days  = ['Mon','Tue','Wed','Thu','Fri','Sat'];
   const times = ['9:00','10:00','11:00','12:00','1:00','2:00','3:00'];
   const slots = {};
@@ -2098,7 +2311,7 @@ async function adminTimetable() {
 
   const days  = ['Mon','Tue','Wed','Thu','Fri','Sat'];
   const times = ['9:00','10:00','11:00','12:00','1:00','2:00','3:00'];
-  const subj  = SUBJ[selBranch] || [];
+  const subj  = getSubjects(selBranch, selSem);
 
   // Build editable grid — teacher dropdown built per-cell so selected works correctly
   function cellHtml(day, time) {
@@ -2263,11 +2476,13 @@ function showNoticeForm() {
 }
 
 async function saveNotice() {
-  const title    = (document.getElementById('ntc_title')    || {}).value.trim();
-  const body     = (document.getElementById('ntc_body')     || {}).value.trim();
+  const title    = stripTags((document.getElementById('ntc_title')    || {}).value.trim());
+  const body     = stripTags((document.getElementById('ntc_body')     || {}).value.trim());
   const priority = (document.getElementById('ntc_priority') || {}).value || 'Medium';
   const date     = (document.getElementById('ntc_date')     || {}).value || new Date().toISOString().split('T')[0];
   if (!title || !body) { showToast('Title and body are required', 'error'); return; }
+  if (!VALIDATE.title(title)) { showToast('Title must be 3–120 characters', 'error'); return; }
+  if (!VALIDATE.body(body))   { showToast('Body must be 5–2000 characters', 'error'); return; }
 
   const id = 'N' + Date.now();
   const notice = { id, title, body, priority, date, postedBy: currentUser.id };
@@ -2289,6 +2504,252 @@ async function deleteNotice(id) {
     navigateTo('adminNotices');
   } catch (e) { showToast('Error: ' + e.message, 'error'); }
 }
+
+
+// ══ SUBJECT MANAGEMENT (Branch × Semester) ══════════════════════════════════
+
+// Default subjects per branch — flat list used when no sem-specific subjects defined
+// SUBJ_SEM stores: { 'CSE_1': [...], 'CSE_2': [...], ... }
+// Falls back to SUBJ[branch] for any sem not explicitly configured
+let SUBJ_SEM = {};  // branch_sem key → subject array
+
+// Get subjects for a specific branch+sem (with fallback to branch default)
+function getSubjects(branch, sem) {
+  const key = branch + '_' + sem;
+  if (SUBJ_SEM[key] && SUBJ_SEM[key].length > 0) return SUBJ_SEM[key];
+  return SUBJ[branch] || [];
+}
+
+async function loadSubjectsFromDB() {
+  if (fbMode !== 'firebase') return;
+  try {
+    const doc = await dbGet('config', 'subjects');
+    if (doc) {
+      if (doc.data)    Object.assign(SUBJ,     doc.data);     // branch-level defaults
+      if (doc.semData) Object.assign(SUBJ_SEM, doc.semData);  // sem-specific
+    }
+  } catch (e) { console.warn('[Subjects] load error:', e.message); }
+}
+
+async function saveSubjectsToDB() {
+  if (fbMode !== 'firebase') { showToast('Subjects saved locally (demo mode)', 'info'); return; }
+  await dbSet('config', 'subjects', {
+    data:    SUBJ,
+    semData: SUBJ_SEM,
+    updatedAt: new Date().toISOString()
+  });
+}
+
+async function adminSubjects() {
+  const selBranch = window._subjBranch || 'CSE';
+  const selSem    = window._subjSem    || 1;
+
+  // Build sem tabs for selected branch
+  function semTabs() {
+    return '<div class="tabs" style="margin-bottom:14px">'
+      + [1,2,3,4,5,6,7,8].map(s =>
+          '<button class="tab-btn' + (s === selSem ? ' active' : '') + '" onclick="switchSubjSem(' + s + ')">'
+          + 'Sem ' + s + '</button>'
+        ).join('')
+      + '</div>';
+  }
+
+  // Current subjects for the selected branch+sem
+  const key     = selBranch + '_' + selSem;
+  const semSubs = SUBJ_SEM[key] ? [...SUBJ_SEM[key]] : [];
+  const defSubs = SUBJ[selBranch] || [];
+  const isCustom = SUBJ_SEM[key] && SUBJ_SEM[key].length > 0;
+
+  function chip(s, i, fromDefault) {
+    const bg = fromDefault ? '#fff' : 'var(--sf2)';
+    return '<div style="display:inline-flex;align-items:center;gap:5px;padding:5px 12px;background:' + bg + ';border:1px solid var(--bd);border-radius:20px;font-size:12.5px;margin:3px 2px">'
+      + sanitize(s)
+      + '<span onclick="removeSubjectSem(\'' + selBranch + '\',' + selSem + ',' + i + ',' + (fromDefault ? 'true' : 'false') + ')" '
+      + 'title="Remove subject" '
+      + 'style="cursor:pointer;color:var(--red);font-size:15px;font-weight:700;margin-left:3px;line-height:1">×</span>'
+      + '</div>';
+  }
+
+  // Branch selector tabs
+  const branchTabs = '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:16px">'
+    + BR.map(b =>
+        '<button onclick="switchSubjBranch(\'' + b + '\')" style="padding:6px 16px;border-radius:20px;border:2px solid ' + (b === selBranch ? 'var(--navy)' : 'var(--bd)') + ';background:' + (b === selBranch ? 'var(--navy)' : 'var(--sf2)') + ';color:' + (b === selBranch ? '#fff' : 'var(--tx2)') + ';font-family:var(--fb);font-size:12.5px;font-weight:600;cursor:pointer">'
+        + b + '</button>'
+      ).join('')
+    + '</div>';
+
+  // Subject edit panel
+  const editPanel = '<div class="card" style="border-left:4px solid var(--gold)">'
+    + '<div class="card-hd">'
+    + '<span class="card-title">' + selBranch + ' — Semester ' + selSem + ' Subjects</span>'
+    + '<div style="display:flex;gap:6px">'
+    + (isCustom
+        ? mkbtn('sec', '↺ Reset to Branch Default', "resetSubjSem('" + selBranch + "'," + selSem + ")")
+        : '')
+    + mkbtn('green', (IC.check || '✓') + ' Save', 'saveSubjectsAndRefresh()')
+    + '</div>'
+    + '</div>'
+
+    // Info badge
+    + '<div style="font-size:11.5px;color:var(--tx3);margin-bottom:12px">'
+    + (isCustom
+        ? '<span style="color:var(--green);font-weight:600">✓ Custom subjects for this semester</span> — these override the branch default'
+        : '<span style="color:var(--amber)">Using branch default subjects.</span> Add a subject below to create a semester-specific list.')
+    + '</div>'
+
+    // Current chips
+    + '<div style="display:flex;flex-wrap:wrap;margin-bottom:14px">'
+    + (semSubs.length > 0
+        ? semSubs.map((s, i) => chip(s, i)).join('')
+        : (defSubs.length > 0
+            ? '<div style="width:100%">'
+              + '<div style="font-size:11px;color:var(--tx3);margin-bottom:8px;font-style:italic">Branch defaults — click <span style="color:var(--red);font-weight:700">×</span> to remove a subject (creates a custom list for this semester):</div>'
+              + '<div>' + defSubs.map((s, i) => chip(s, i, true)).join('') + '</div>'
+              + '</div>'
+            : '<span style="font-size:12px;color:var(--tx3);font-style:italic">No subjects yet — add one below</span>'))
+    + '</div>'
+
+    // Add input
+    + '<div style="padding-top:12px;border-top:1px solid var(--bd)">'
+    + '<div style="font-size:11px;font-weight:700;color:var(--tx3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px">'
+    + 'Add Subject to ' + selBranch + ' Sem ' + selSem
+    + '</div>'
+    + '<div style="display:flex;gap:8px">'
+    + '<input class="si" id="newSubjInp" placeholder="e.g. Machine Learning, Microprocessors..." style="flex:1" '
+    + 'onkeypress="if(event.key===\'Enter\') addSubjectSem(\'' + selBranch + '\',' + selSem + ')">'
+    + mkbtn('gold', '+ Add', "addSubjectSem('" + selBranch + "'," + selSem + ")")
+    + '</div>'
+    + '<div style="font-size:11px;color:var(--tx3);margin-top:8px">Click × on a chip to remove · Click Save to persist to Firebase</div>'
+    + '</div>'
+    + '</div>';
+
+  // Summary table — all sems for selected branch
+  const summaryRows = [1,2,3,4,5,6,7,8].map(s => {
+    const k   = selBranch + '_' + s;
+    const ss  = SUBJ_SEM[k] && SUBJ_SEM[k].length > 0 ? SUBJ_SEM[k] : null;
+    const cnt = ss ? ss.length : defSubs.length;
+    const src = ss ? 'Custom' : 'Default';
+    return '<tr style="' + (s === selSem ? 'background:rgba(10,36,99,.05)' : '') + '">'
+      + '<td style="padding:7px 12px;font-weight:600;color:var(--navy)">'
+      + '<button onclick="switchSubjSem(' + s + ')" style="background:none;border:none;cursor:pointer;color:var(--navy);font-weight:600;font-family:var(--fb);font-size:13px">Sem ' + s + '</button>'
+      + '</td>'
+      + '<td style="padding:7px 12px;font-size:12px;color:var(--tx2)">' + cnt + ' subjects</td>'
+      + '<td style="padding:7px 12px"><span class="badge ' + (ss ? 'bg' : 'ba') + '">' + src + '</span></td>'
+      + '<td style="padding:7px 12px;font-size:11.5px;color:var(--tx3)">'
+      + (ss ? ss.slice(0,3).map(x => sanitize(x)).join(', ') + (ss.length > 3 ? '…' : '') : defSubs.slice(0,3).map(x => sanitize(x)).join(', ') + (defSubs.length > 3 ? '…' : ''))
+      + '</td>'
+      + '</tr>';
+  }).join('');
+
+  mc().innerHTML = [
+    hdr('Subject Management', selBranch + ' — Semester ' + selSem,
+      mkbtn('green', (IC.check || '✓') + ' Save All to Firebase', 'saveSubjectsAndRefresh()')),
+
+    // Branch picker
+    branchTabs,
+
+    '<div style="display:grid;grid-template-columns:1fr 340px;gap:16px;align-items:start">',
+
+    // Left: edit panel with sem tabs
+    '<div>'
+    + semTabs()
+    + editPanel
+    + '</div>',
+
+    // Right: summary table
+    '<div class="card" style="padding:0;overflow:hidden">'
+    + '<div class="card-hd" style="padding:12px 14px"><span class="card-title">All Semesters — ' + selBranch + '</span></div>'
+    + '<div class="tbl-wrap"><table style="width:100%;border-collapse:collapse">'
+    + '<thead><tr>'
+    + '<th style="padding:8px 12px;background:var(--navy);color:#fff;font-size:11px;text-align:left">Sem</th>'
+    + '<th style="padding:8px 12px;background:var(--navy);color:#fff;font-size:11px;text-align:left">Count</th>'
+    + '<th style="padding:8px 12px;background:var(--navy);color:#fff;font-size:11px;text-align:left">Source</th>'
+    + '<th style="padding:8px 12px;background:var(--navy);color:#fff;font-size:11px;text-align:left">Preview</th>'
+    + '</tr></thead>'
+    + '<tbody>' + summaryRows + '</tbody>'
+    + '</table></div></div>',
+
+    '</div>',
+    '<div style="font-size:11px;color:var(--tx3);margin-top:8px;text-align:right">Saved to Firebase config/subjects · Applied immediately to timetables, grades and attendance</div>'
+  ].join('');
+}
+
+function switchSubjBranch(br) {
+  window._subjBranch = br;
+  window._subjSem    = window._subjSem || 1;
+  navigateTo('adminSubjects');
+}
+
+function switchSubjSem(sem) {
+  window._subjSem = sem;
+  navigateTo('adminSubjects');
+}
+
+// Keep toggleSubjBranch for backward compat (old onclick refs)
+function toggleSubjBranch(br) { switchSubjBranch(br); }
+
+function addSubjectSem(br, sem) {
+  const inp = document.getElementById('newSubjInp');
+  if (!inp) return;
+  const val = stripTags(inp.value.trim());
+  if (!val)                               { showToast('Enter a subject name', 'error'); return; }
+  if (val.length < 2 || val.length > 80) { showToast('Subject name must be 2–80 characters', 'error'); return; }
+  const key = br + '_' + sem;
+  // If no custom list yet, clone from branch default so user sees existing subjects
+  if (!SUBJ_SEM[key] || SUBJ_SEM[key].length === 0) {
+    SUBJ_SEM[key] = [...(SUBJ[br] || [])];
+  }
+  if (SUBJ_SEM[key].map(s => s.toLowerCase()).includes(val.toLowerCase())) {
+    showToast('"' + val + '" already exists in ' + br + ' Sem ' + sem, 'error'); return;
+  }
+  SUBJ_SEM[key].push(val);
+  showToast(val + ' added to ' + br + ' Sem ' + sem, 'success');
+  navigateTo('adminSubjects');
+}
+
+// Keep addSubject for backward compat (branch-level add)
+function addSubject(br) { addSubjectSem(br, window._subjSem || 1); }
+
+function removeSubjectSem(br, sem, idx, fromDefault) {
+  const key = br + '_' + sem;
+
+  // If removing from branch defaults, first clone defaults into SUBJ_SEM to make it custom
+  if (fromDefault || !SUBJ_SEM[key] || SUBJ_SEM[key].length === 0) {
+    SUBJ_SEM[key] = [...(SUBJ[br] || [])];
+  }
+
+  if (SUBJ_SEM[key][idx] === undefined) return;
+  const name = SUBJ_SEM[key][idx];
+  SUBJ_SEM[key].splice(idx, 1);
+  showToast('"' + name + '" removed from ' + br + ' Sem ' + sem + ' · Click Save to persist', 'info');
+  navigateTo('adminSubjects');
+}
+
+// Keep removeSubject for backward compat
+function removeSubject(br, idx) { removeSubjectSem(br, window._subjSem || 1, idx); }
+
+function resetSubjSem(br, sem) {
+  const key = br + '_' + sem;
+  if (!confirm('Reset Sem ' + sem + ' to branch default subjects for ' + br + '?')) return;
+  delete SUBJ_SEM[key];
+  showToast('Sem ' + sem + ' reset to ' + br + ' branch default', 'info');
+  navigateTo('adminSubjects');
+}
+
+async function saveSubjectsAndRefresh() {
+  const btn = document.querySelector('[onclick="saveSubjectsAndRefresh()"]');
+  if (btn) { btn.disabled = true; btn.textContent = 'Saving...'; }
+  try {
+    await saveSubjectsToDB();
+    showToast('Subjects saved to Firebase ✓', 'success');
+    if (btn) { btn.disabled = false; btn.innerHTML = (IC.check || '✓') + ' Save All to Firebase'; }
+  } catch(e) {
+    showToast('Save failed: ' + e.message, 'error');
+    if (btn) { btn.disabled = false; btn.innerHTML = (IC.check || '✓') + ' Save All to Firebase'; }
+  }
+}
+
+// ══ END SUBJECT MANAGEMENT ════════════════════════════════════════════════════
 
 async function adminSettings() {
   mc().innerHTML = [
@@ -2316,7 +2777,7 @@ async function adminSettings() {
     '<div style="font-size:12.5px;color:var(--tx2);line-height:2">',
     [
       'Open <a href="https://console.firebase.google.com" target="_blank" style="color:var(--blue2)">console.firebase.google.com</a>',
-      'Select your project → <strong style="color:var(--tx)">your-project-id</strong>',
+      'Select your project → <strong style="color:var(--tx)">your-firebase-project-id</strong>',
       'Left sidebar → <strong style="color:var(--tx)">Firestore Database</strong>',
       'Click the <strong style="color:var(--tx)">Rules</strong> tab at the top',
       'Click <strong style="color:var(--gold)">Copy Rules</strong> below, then paste into the Firebase editor',
@@ -2986,7 +3447,7 @@ async function studentAttendance() {
   }
 
   // Build per-subject stats from real records
-  const subjects   = SUBJ[s.branch] || [];
+  const subjects   = getSubjects(s.branch, s.semester || 1);
   const subStats   = {};
   subjects.forEach(sub => { subStats[sub] = { held: 0, present: 0 }; });
   records.forEach(r => {
@@ -3112,7 +3573,7 @@ async function studentGrades() {
   function gradeLabel(pct) { return pct >= 90 ? 'O' : pct >= 80 ? 'A+' : pct >= 70 ? 'A' : pct >= 60 ? 'B+' : pct >= 55 ? 'B' : pct >= 40 ? 'C' : 'F'; }
   function gradeBadge(pct) { return pct >= 70 ? 'bg' : pct >= 55 ? 'ba' : 'br'; }
 
-  const rows = (SUBJ[s.branch] || []).map((sub, i) => {
+  const rows = getSubjects(s.branch, s.semester || 1).map((sub, i) => {
     const real = gradeMap[sub];
     let ia1, ia2, ia, see, fin, g, badge;
     if (real) {
@@ -3423,10 +3884,19 @@ function clearChat() {
 // ── SEND MESSAGE TO GROQ ────────────────────────
 async function sendChat() {
   const inp = document.getElementById('chatInp'); if (!inp) return;
-  const msg = inp.value.trim(); if (!msg) return;
+  const msg = stripTags(inp.value.trim()); if (!msg) return;
 
   if (!GROQ_API_KEY || GROQ_API_KEY === 'YOUR_GROQ_API_KEY_HERE') {
     showToast('Paste your Groq API key in app.js (GROQ_API_KEY)', 'error');
+    return;
+  }
+
+  // Rate limit: 20 msgs/min, 100 msgs/hour
+  if (!chatRateCheck()) return;
+
+  // Validate message length
+  if (!VALIDATE.msg(msg)) {
+    showToast('Message too long (max 2000 characters)', 'error');
     return;
   }
 
@@ -3527,7 +3997,7 @@ function sendQ(q) { const i = document.getElementById('chatInp'); if (i) { i.val
 async function studentClassroom() {
   const s = currentUser;
   mc().innerHTML = hdr('Google Classroom', 'Enrolled courses') +
-    (SUBJ[s.branch] || []).map((sub, i) => {
+    getSubjects(s.branch, s.semester || 1).map((sub, i) => {
       const p = [3, 0, 1, 2][i % 4]; const col = ['#1a73e8', '#34a853', '#ea4335', '#fbbc04'][i % 4];
       return '<div class="gc-card" onclick="window.open(\'https://classroom.google.com\',\'_blank\')">'
         + '<div class="gc-ico" style="background:' + col + '18;color:' + col + '">' + IC.classroom + '</div>'
@@ -3663,14 +4133,34 @@ async function downloadStudentDoc(reqId) {
 }
 
 async function submitDocReq() {
-  const type = (document.getElementById('docType') || {}).value || 'Bonafide';
-  const reason = (document.getElementById('docReason') || {}).value || '';
+  // Rate limit: 3 requests per day
+  if (!docReqRateCheck()) return;
+
+  const type   = stripTags((document.getElementById('docType')   || {}).value || 'Bonafide');
+  const reason = stripTags((document.getElementById('docReason') || {}).value || '');
   if (!reason.trim()) { showToast('Please enter a reason', 'error'); return; }
-  const data = { id: 'DR' + Date.now(), stuId: currentUser.id.toUpperCase(), stuName: currentUser.name, type, reason, delivery: (document.getElementById('docDelivery')||{}).value||'Collect in Person', date: new Date().toISOString().split('T')[0], status: 'Pending' };
+  if (!VALIDATE.reason(reason)) { showToast('Reason too long (max 500 characters)', 'error'); return; }
+  const data = { id: 'DR' + Date.now(), stuId: currentUser.id.toUpperCase(), stuName: sanitize(currentUser.name), type, reason: sanitize(reason), delivery: (document.getElementById('docDelivery')||{}).value||'Collect in Person', date: new Date().toISOString().split('T')[0], status: 'Pending' };
   // Use dbSet with custom ID so we can look up by data.id later
-  if (fbMode === 'firebase') await dbSet('docRequests', data.id, data);
-  else DEMO.docRequests.push(data);
-  showToast('Request submitted', 'success');
+  if (fbMode === 'firebase') {
+    // Check for existing Pending/Processing request of same type to prevent duplicates
+    try {
+      const existing = await getDocReqs();
+      const dup = existing.find(r =>
+        r.stuId && r.stuId.toUpperCase() === data.stuId &&
+        r.type === data.type &&
+        (r.status === 'Pending' || r.status === 'Processing')
+      );
+      if (dup) {
+        showToast('You already have a ' + data.type + ' request that is ' + dup.status + '. Please wait for it to be processed.', 'error');
+        return;
+      }
+    } catch (_) {}
+    await dbSet('docRequests', data.id, data);
+  } else {
+    DEMO.docRequests.push(data);
+  }
+  showToast('Request submitted successfully', 'success');
   navigateTo('studentDocReq');
 }
 
@@ -3996,11 +4486,12 @@ async function quickFaceReg(personId, type) {
 
 const FACE_MATCH_THRESHOLD = 0.90; // very lenient — accepts varied lighting, angles and conditions
 
-// Multiple CDN fallbacks — jsdelivr may fail when running from file://
+// Multiple CDN fallbacks for model weights
 const FACE_MODEL_CDNS = [
   'https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/weights',
   'https://unpkg.com/face-api.js@0.22.2/weights',
-  'https://raw.githack.com/justadudewhohacks/face-api.js/master/weights',
+  'https://raw.githack.com/justadudewhohacks/face-api.js/0.22.2/weights',
+  'https://raw.githubusercontent.com/justadudewhohacks/face-api.js/master/weights',
 ];
 
 let _faceApiReady   = false;
@@ -4016,8 +4507,20 @@ async function loadFaceApi() {
   _faceApiLoading = true;
   _faceApiError   = null;
 
+  // Wait up to 15s for the face-api.js script itself to finish loading from CDN
   if (typeof faceapi === 'undefined') {
-    _faceApiError   = 'face-api.js script not loaded';
+    console.log('[FaceAPI] Script not yet loaded — waiting up to 15s...');
+    const deadline = Date.now() + 15000;
+    while (typeof faceapi === 'undefined' && Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 300));
+    }
+  }
+
+  // If still undefined after waiting, all CDNs failed
+  if (typeof faceapi === 'undefined') {
+    _faceApiError   = window._faceApiScriptFailed
+      ? 'face-api.js could not be loaded from any CDN — check internet connection'
+      : 'face-api.js script timed out — slow connection or CDN blocked';
     _faceApiLoading = false;
     return false;
   }
@@ -4221,6 +4724,12 @@ async function capturePhotoForLogin() {
   if (!camStream || !video || video.readyState < 2) {
     stat1.textContent = 'Camera not ready — wait a moment and try again';
     stat1.className = 'cam-st error';
+    if (btn) { btn.disabled = false; btn.textContent = '📷 Capture Photo'; }
+    return;
+  }
+
+  // Rate limit face capture attempts
+  if (!faceRateCheck()) {
     if (btn) { btn.disabled = false; btn.textContent = '📷 Capture Photo'; }
     return;
   }
@@ -4494,6 +5003,8 @@ async function loginWithFace(key, type, personId, faceRecord) {
       + '<div style="font-size:11px;color:var(--tx3);margin-top:6px">Entering portal...</div>'
       + '</div>';
   }
+  loginSuccess(type);      // clear login rate limit
+  resetActivityTimer();    // start session timeout
   setTimeout(() => { closeFaceLoginModal(); enterDash(); }, 700);
 }
 
@@ -4646,14 +5157,14 @@ window.addEventListener('DOMContentLoaded', async function () {
       new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 6000))
     ]);
     // Reachable — show setup box in case accounts haven't been created yet
-    setFbDot('on', FB_CFG.projectId);
+    setFbDot('on', 'your-project-id');
     const sb = document.getElementById('setupBox');
     if (sb) sb.style.display = 'block';
   } catch (e) {
     if (e.code === 'permission-denied') {
       // Security rules active — correct secured state, accounts exist
       fbMode = 'firebase';
-      setFbDot('on', FB_CFG.projectId);
+      setFbDot('on', 'your-project-id');
       const sb = document.getElementById('setupBox');
       if (sb) sb.style.display = 'none';
     } else if (e.message === 'timeout') {
@@ -4663,7 +5174,7 @@ window.addEventListener('DOMContentLoaded', async function () {
       if (sb) sb.style.display = 'none';
     } else {
       console.warn('Firebase startup:', e.code, e.message);
-      setFbDot('on', FB_CFG.projectId);
+      setFbDot('on', 'your-project-id');
     }
   }
 
